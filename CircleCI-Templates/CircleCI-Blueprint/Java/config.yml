@@ -1,0 +1,210 @@
+version: 2.1
+
+jobs:
+  build:
+    description: build
+    working_directory: ~/<ApplicationName>
+    docker:
+      - image: maven:3.6.3-jdk-8
+    steps:
+      - checkout
+      - run:
+          name: Setup Dependencies
+          command: ./.circleci/setup_dependencies.sh
+      - restore_cache:
+          keys:
+            - v1-npm-dependencies-{{ checksum "ui/package-lock.json" }}
+      - run:
+          name: Install npm dependencies for client app
+          command: cd ui && npm install
+      - save_cache:
+          key: v1-npm-dependencies-{{ checksum "ui/package-lock.json" }}
+          paths:
+            - ui/node_modules
+      - run:
+          name: Build client app
+          command: >
+            cd ui && 
+             npm run build -- --prod
+      - run:
+          name: Build java app
+          command: mvn clean install -Dmaven.test.skip=true
+  build-and-zip:
+    description: Build the app and zip the output
+    working_directory: ~/<ApplicationName>
+    docker:
+      - image: maven:3.6.3-jdk-8
+    steps:
+      - checkout
+      - run:
+          name: Setup Dependencies
+          command: ./.circleci/setup_dependencies.sh
+      - restore_cache:
+          keys:
+            - v1-npm-dependencies-{{ checksum "ui/package-lock.json" }}
+      - run:
+          name: Install npm dependencies for client app
+          command: cd ui && npm install
+      - save_cache:
+          key: v1-npm-dependencies-{{ checksum "ui/package-lock.json" }}
+          paths:
+            - ui/node_modules
+      - run:
+          name: Build client app
+          command: >
+            cd ui && 
+             npm run build -- --prod
+      - run:
+          name: Copy ui build to package folder
+          command: ./.circleci/copy_ui_build.sh
+      - run:
+          name: Build java app
+          command: mvn clean install -Dmaven.test.skip=true
+      - run:
+          name: Update PATH and Define Environment Variable at Runtime
+          command: |
+            echo 'export pluginId=<PluginID>'>> $BASH_ENV
+            source $BASH_ENV
+      - run:
+          name: Zip the build output
+          command: ./.circleci/setup_zip_build_output.sh
+      - run:
+          name: Install jFrog CLI
+          command: curl -fL https://getcli.jfrog.io | sh
+      - run:
+          name: Push to Artifactory
+          command: |
+            if [ $CIRCLE_JOB == "build-and-zip" ]; then export BUILD_ID=$CIRCLE_WORKFLOW_ID; else export BUILD_ID=$CIRCLE_BUILD_NUM;fi
+            ./jfrog rt c --url ${ARTIFACTORY_URL}artifactory --user $ARTIFACTORY_USER --apikey $ARTIFACTORY_TOKEN --interactive=false
+            ./jfrog rt u package-output/<ApplicationName>_$CIRCLE_BUILD_NUM.zip /generic-dev-local/UpShift/<ApplicationName>/ --build-name=<ApplicationName> --build-number=$CIRCLE_BUILD_NUM --props build.id=$BUILD_ID
+  promote-to-prod:
+    description: Promote the build to production artifactory
+    working_directory: ~/<ApplicationName>
+    docker:
+      - image: circleci/node:9.11.1-stretch
+    steps:
+      - checkout
+      - run:
+          name: Promote build
+          command: ./.circleci/promote_build.sh
+  checkmarx_scan:
+    docker:
+      - image: codehub-docker.jfrog.io/devops-checkmarx:latest
+        auth:
+          username: $ARTIFACTORY_USER
+          password: $ARTIFACTORY_TOKEN
+    working_directory: ~/<ApplicationName>
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run:
+          name: Start the Checkmarx scan
+          command: |
+            /opt/CxConsolePlugin/runCxConsole.sh Scan -v \
+            -CxServer $CHECKMARX_SERVER \
+            -Cxuser $CHECKMARX_USER \
+            -CxPassword $CHECKMARX_PASSWORD \
+            -ProjectName "CxServer\Acc-IPReady\<ApplicationName>" \
+            -LocationType folder \
+            -LocationPath ~/<ApplicationName> \
+            -Preset "Cognizant Default Preset" \
+            -executepackagedependency \
+            -ReportPDF ~/app/report/<ApplicationName>-scan-results.pdf
+      - store_artifacts:
+          path: ~/app/report/<ApplicationName>-scan-results.pdf
+  blackduck_scan:
+    docker:
+      - image: maven:3.6.3-jdk-8
+    working_directory: ~/<ApplicationName>
+    steps:
+      - checkout
+      - attach_workspace:
+          at: workspace
+      - run:
+          name: Setup Dependencies
+          command: ./.circleci/setup_dependencies.sh
+      - run:
+          name: Install npm packages
+          command: cd ui && npm install
+      - run:
+          name: Start the Synopsys Detect scan
+          command: |
+            bash ./.circleci/detect.sh \
+            --blackduck.url=$BLACKDUCK_URL \
+            --blackduck.api.token=$BLACKDUCK_TOKEN \
+            --detect.blackduck.signature.scanner.snippet.matching=SNIPPET_MATCHING \
+            --detect.npm.path=/usr/bin/npm \
+            --detect.npm.node.path=/usr/bin/node \
+            --detect.project.name="<ApplicationName>" \
+            --detect.project.version.name="19411.1" \
+            --detect.risk.report.pdf=true \
+            --detect.risk.report.pdf.path="~/<ApplicationName>/report" \
+            --detect.notices.report=true \
+            --detect.notices.report.path="~/<ApplicationName>/report"
+      - store_artifacts:
+          path: ~/<ApplicationName>/report
+workflows:
+  build_zip_and_publish:
+    jobs:
+      - checkmarx_scan:
+          context: Codehub-Common
+          filters:
+            branches:
+              only: # Follow branching conventions matching the regex
+                - /sast\/.*/ #eg sast/1, sast/prod
+      - blackduck_scan:
+          context: Codehub-Common
+          filters:
+            branches:
+              only: # Follow branching conventions matching the regex
+                - /oss\/.*/ # eg: oss/1, oss/prod
+      - build:
+          filters:
+            branches:
+              ignore:
+                - /sast\/.*/
+                - /oss\/.*/
+                - master # Since "build-and-zip" job does build as well
+      - request-to-move-integration-build-to-artifactory:
+          type: approval
+          requires:
+            - build
+          filters:
+            branches:
+              only:
+                - Integration
+      - build-and-zip:
+          name: move-integration-build-to-artifactory
+          context:
+            - Codehub-Common
+            - Upshift-Common
+          requires:
+            - request-to-move-integration-build-to-artifactory
+          filters:
+            branches:
+              only:
+                - Integration
+      - build-and-zip:
+          context:
+            - Codehub-Common
+            - Upshift-Common
+          filters:
+            branches:
+              only:
+                - master
+      - request-promote-to-prod:
+          type: approval
+          requires:
+            - build-and-zip
+          filters:
+            branches:
+              only:
+                - master
+      - promote-to-prod:
+          context: Codehub-Common
+          requires:
+            - request-promote-to-prod
+          filters:
+            branches:
+              only:
+                - master
