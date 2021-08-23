@@ -1,0 +1,27 @@
+---
+name: RabbitMQ Migrator
+
+description: >
+  This plugin can be used to migrate RabbitMQ to Cloud managed Messaging queue.
+
+pluginType: runAsCustomRecipe
+
+implementationLanguage: Java
+
+targetSourceCodeLanguage: Java
+
+steps: |
+  Identify the Rabbit MQ used in pom.xml/build.gradle/lib
+  Identify the Listeners, Producers and Consumers
+  Migrate the config and code to destination cloud message queue
+
+scope: |
+   Supports Java applications
+
+blueprintType: '["moveToCloud"]'
+
+authorName: rajkumar.jayakumar@cognizant.com
+
+isEnabled: true
+
+version: 3.0.0
